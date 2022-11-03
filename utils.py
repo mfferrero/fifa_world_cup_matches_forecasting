@@ -5,43 +5,29 @@ and/or summarization.
 """
 from random import random
 import pandas as pd
-import pygal
+import numpy as np
+
+#import pygal
 from sklearn.preprocessing import StandardScaler
 
 
-RAW_MATCHES_FILE = 'raw_matches.csv'
+RAW_MATCHES_FILE = 'matches.csv'
 RAW_WINNERS_FILE = 'raw_winners.csv'
-TEAM_RENAMES_FILE = 'team_renames.csv'
-
-
-def apply_renames(column):
-    """Apply team renames to a team column from a dataframe."""
-    with open(TEAM_RENAMES_FILE) as renames_file:
-        renames = dict(l.strip().split(',')
-                       for l in renames_file.readlines()
-                       if l.strip())
-
-        def renamer(team):
-            return renames.get(team, team)
-
-    return column.map(renamer)
 
 
 def get_matches(with_team_stats=False, duplicate_with_reversed=False,
                 exclude_ties=False):
     """Create a dataframe with matches info."""
-    matches = pd.DataFrame.from_csv(RAW_MATCHES_FILE)
-    for column in ('team1', 'team2'):
-        matches[column] = apply_renames(matches[column])
+    matches = pd.read_csv(RAW_MATCHES_FILE)
 
     if duplicate_with_reversed:
         id_offset = len(matches)
 
         matches2 = matches.copy()
-        matches2.rename(columns={'team1': 'team2',
-                                 'team2': 'team1',
-                                 'score1': 'score2',
-                                 'score2': 'score1'},
+        matches2.rename(columns={'home_team': 'away_team',
+                                 'away_team': 'home_team',
+                                 'home_score': 'away_score',
+                                 'away_score': 'home_score'},
                         inplace=True)
         matches2.index = matches2.index.map(lambda x: x + id_offset)
 
@@ -55,7 +41,7 @@ def get_matches(with_team_stats=False, duplicate_with_reversed=False,
         else:
             return 0
 
-    matches['score_diff'] = matches['score1'] - matches['score2']
+    matches['score_diff'] = matches['home_score'] - matches['away_score']
     matches['winner'] = matches['score_diff']
     matches['winner'] = matches['winner'].map(winner_from_score_diff)
 
@@ -65,16 +51,15 @@ def get_matches(with_team_stats=False, duplicate_with_reversed=False,
     if with_team_stats:
         stats = get_team_stats()
 
-        matches = matches.join(stats, on='team1')\
-                         .join(stats, on='team2', rsuffix='_2')
+        matches = matches.join(stats, on='home_team')\
+                         .join(stats, on='away_team', rsuffix='_2')
 
     return matches
 
 
 def get_winners():
     """Create a dataframe with podium positions info."""
-    winners = pd.DataFrame.from_csv(RAW_WINNERS_FILE)
-    winners.team = apply_renames(winners.team)
+    winners = pd.read_csv(RAW_WINNERS_FILE)
 
     return winners
 
@@ -84,23 +69,23 @@ def get_team_stats():
     winners = get_winners()
     matches = get_matches()
 
-    teams = set(matches.team1.unique()).union(matches.team2.unique())
+    teams = set(matches.home_team.unique()).union(matches.away_team.unique())
 
     stats = pd.DataFrame(list(teams), columns=['team'])
 
     stats = stats.set_index('team')
 
     for team in teams:
-        team_matches = matches[(matches.team1 == team) |
-                               (matches.team2 == team)]
+        team_matches = matches[(matches.home_team == team) |
+                               (matches.away_team == team)]
         stats.loc[team, 'matches_played'] = len(team_matches)
 
-        # wins where the team was on the left side (team1)
-        wins1 = team_matches[(team_matches.team1 == team) &
-                             (team_matches.score1 > team_matches.score2)]
-        # wins where the team was on the right side (team2)
-        wins2 = team_matches[(team_matches.team2 == team) &
-                             (team_matches.score2 > team_matches.score1)]
+        # wins where the team was on the left side (home_team)
+        wins1 = team_matches[(team_matches.home_team == team) &
+                             (team_matches.home_score > team_matches.away_score)]
+        # wins where the team was on the right side (away_team)
+        wins2 = team_matches[(team_matches.away_team == team) &
+                             (team_matches.away_score > team_matches.home_score)]
 
         stats.loc[team, 'matches_won'] = len(wins1) + len(wins2)
 
@@ -183,9 +168,9 @@ def split_samples(inputs, outputs, percent=0.75):
 
 
 def graph_matches_results_scatter(matches, feature_x, feature_y):
-    wins1 = matches[matches.score1 > matches.score2]
-    wins2 = matches[matches.score1 < matches.score2]
-    ties = matches[matches.score1 == matches.score2]
+    wins1 = matches[matches.home_score > matches.away_score]
+    wins2 = matches[matches.home_score < matches.away_score]
+    ties = matches[matches.home_score == matches.away_score]
 
     graph = pygal.XY(stroke=False,
                      title='Results dispersion by %s, %s' % (feature_x, feature_y),
@@ -210,3 +195,52 @@ def graph_teams_stat_bars(team_stats, stat):
     graph.add(stat, sorted_team_stats[stat])
 
     return graph
+
+def predict(year, team1, team2, predictor_instance, df_team_stats, df_matches, input_features, include_goals=True):
+    inputs = []
+    
+    if team1 not in df_team_stats.index:
+        return 'No stats for provided home team ! You could try to predict the result using a similar team'
+    
+    if team2 not in df_team_stats.index:
+        return 'No stats for provided away team ! You could try to predict the result using a similar team'
+    
+    for feature in input_features:
+        from_team_2 = '_2' in feature
+        feature = feature.replace('_2', '')
+        
+        if feature in df_team_stats.columns.values:
+            team = team2 if from_team_2 else team1
+            value = df_team_stats.loc[team, feature]
+        elif feature == 'year':
+            value = year
+        else:
+            raise ValueError("Don't know where to get feature: " + feature)
+            
+        inputs.append(value)
+        
+    result = predictor_instance.predict([inputs])
+    
+    if include_goals:
+        #total_team1_goals = df_matches[df_matches.home_team == team1].home_score.sum() + df_matches[df_matches.away_team == team1].away_score.sum()
+        #team1_goals_average = np.round(total_team1_goals / df_team_stats.loc[team1].matches_played)
+        total_team1_goals = list(df_matches[df_matches.home_team == team1].home_score) + list(df_matches[df_matches.away_team == team1].away_score)
+        team1_goals_average = np.median(total_team1_goals)
+        
+        #total_team2_goals = df_matches[df_matches.home_team == team2].home_score.sum() + df_matches[df_matches.away_team == team2].away_score.sum()
+        #team2_goals_average = np.round(total_team2_goals / df_team_stats.loc[team2].matches_played)
+        total_team2_goals = list(df_matches[df_matches.home_team == team2].home_score) + list(df_matches[df_matches.away_team == team2].away_score)
+        team2_goals_average = np.median(total_team2_goals)
+        
+        goals_result = f'{team1}: {int(team1_goals_average)} - {team2}: {int(team2_goals_average)}'
+        
+        print('Goals prediction: ', goals_result)
+    
+    if result == 0:
+        print('Tie')
+    elif result == 1:
+        print(team1)
+    elif result == 2:
+        print(team2)
+    else:
+        return 'Unknown result: ' + str(result)
